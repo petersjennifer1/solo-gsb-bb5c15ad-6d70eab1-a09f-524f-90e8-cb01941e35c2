@@ -4,6 +4,9 @@
   右段前缀做最优对齐，返回最高分对齐的原文区间、逐列对齐和拼接文本。
 - ``POST /api/assemble``：提交按阅读顺序排列的 2～5 段转写，逐段复用上述
   后缀-前缀对齐拼接，并返回最终文本与逐字来源列表。
+- ``POST /api/collate``：沿用 ``/api/assemble`` 的限制与门槛复用其拼接文本和
+  逐字来源，逐位置回查各来源原字并以原始段为单位投票，列出存在异文的位置、
+  候选字、支持段序号与建议字（最高票并列时为 null），不自动改写拼接文本。
 """
 
 from fastapi import FastAPI, HTTPException
@@ -11,6 +14,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from .aligner import align
 from .assembler import AssemblyError, assemble
+from .collator import collate
 
 MAX_TEXT_LEN = 500   # 单段文本最大长度（残页转写通常远小于此）
 MAX_SEGMENTS = 5     # /api/assemble 最大段数
@@ -142,12 +146,48 @@ class AssembleResponse(BaseModel):
     )
 
 
+class CollateCandidate(BaseModel):
+    """异文候选字及支持它的原始段（同段重复只计一次）。"""
+
+    char: str = Field(..., description="候选字形（已知字，不含 ?）")
+    segments: list[int] = Field(
+        ...,
+        description="支持该候选字的原始段序号列表（从 0 开始，升序）",
+    )
+
+
+class CollateVariant(BaseModel):
+    """一个异文位置。"""
+
+    pos: int = Field(..., description="位置下标（拼接文本中的下标，从 0 开始）")
+    char: str = Field(..., description="当前拼接文本在该位置的字（不自动改写）")
+    candidates: list[CollateCandidate] = Field(
+        ...,
+        description="各候选字及支持段序号；按票数降序、同票按字形升序",
+    )
+    suggested: str | None = Field(
+        ...,
+        description="建议字：唯一最高票候选；最高票并列时为 null",
+    )
+
+
+class CollateResponse(BaseModel):
+    """多段转写校勘结果。"""
+
+    text: str = Field(..., description="拼接文本（与 /api/assemble 结果一致，不被自动改写）")
+    variants: list[CollateVariant] = Field(
+        ...,
+        description="异文位置列表；仅含至少两种不同已知字的位置，按位置升序",
+    )
+
+
 @app.get("/", summary="服务信息")
 def index():
     return {
         "name": "古籍残页转写拼接 API",
         "align": "POST /api/align",
         "assemble": "POST /api/assemble",
+        "collate": "POST /api/collate",
         "docs": "/docs",
         "health": "/health",
     }
@@ -188,6 +228,34 @@ def api_align(req: AlignRequest):
 def api_assemble(req: AssembleRequest):
     try:
         return assemble(req.segments)
+    except AssemblyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(exc),
+                "failed_segment": exc.failed_segment,
+            },
+        ) from exc
+
+
+@app.post(
+    "/api/collate",
+    response_model=CollateResponse,
+    status_code=200,
+    summary="复核多段残页转写：逐位置回查来源原字并列异文",
+    description=(
+        "请求限制与续接门槛与 `/api/assemble` 完全相同（2～5 段、单段最长 500 字、"
+        "总长最长 800 字；每步最高对齐得分 > 0 且至少 2 对相同已知字，否则返回 422 "
+        "并给出 `failed_segment`）。复用其拼接文本与逐字来源，逐位置回查所有来源"
+        "原字：以原始段为投票单位，同段重复来源只计一次，`?` 不投票。仅返回至少"
+        "有两种不同已知字的异文位置，给出位置、当前拼接字、各候选字及支持段序号；"
+        "唯一最高票候选作为 `suggested` 建议字，最高票并列时为 null。接口不自动"
+        "改写拼接文本；仅 `?` 补字而无异文的位置不列入。"
+    ),
+)
+def api_collate(req: AssembleRequest):
+    try:
+        return collate(req.segments)
     except AssemblyError as exc:
         raise HTTPException(
             status_code=422,

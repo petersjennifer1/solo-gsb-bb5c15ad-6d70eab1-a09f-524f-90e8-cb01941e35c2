@@ -4,6 +4,9 @@
 返回最高分对齐的原文区间、逐列对齐和拼接文本。
 - **`POST /api/assemble`**：提交按阅读顺序排列的 **2～5 段**转写（每段最长 500 字、总长最长 800 字），
 逐段复用上述后缀-前缀对齐完成拼接，返回最终文本与**逐字来源列表**。
+- **`POST /api/collate`**：沿用 `/api/assemble` 的段数限制与续接门槛，复用其拼接文本与逐字来源，
+逐位置回查各来源原字并**以原始段为单位投票**，仅列出存在至少两种已知字的**异文位置**，给出候选字、
+支持段序号与建议字（最高票并列时为 `null`）；**不自动改写**拼接文本。
 
 ## 快速开始
 
@@ -145,6 +148,83 @@ curl -X POST http://localhost:8000/api/assemble \
 }
 ```
 
+### `POST /api/collate`
+
+供校勘人员复核多份残页转写。请求体与限制（2～5 段、单段最长 500 字、总长最长 800 字）和**续接门槛**
+（任一步得分 ≤ 0 或相同已知字不足 2 对即返回 **422** 并给出 `failed_segment`）与 `/api/assemble` 完全相同。
+
+接口先复用 `/api/assemble` 得到拼接文本 `text` 与逐字来源，再对**每个输出位置**回查所有来源原字：
+
+- **以原始段为投票单位**：同一段在同一位置的重复来源只计一票；
+- 来源原字为 `?` 时**不投票**；
+- **仅当至少出现两种不同已知字**时才列入 `variants`；单纯的 `?` 补字位置不列入；
+- `suggested` 为**唯一最高票**候选字；最高票并列时为 `null`；
+- 只给建议，**不自动改写** `text`（`char` 始终等于 `text[pos]`）。
+
+请求体：
+
+```json
+{
+  "segments": ["学而时习之不", "学而?习之不", "学而时习之否"]
+}
+```
+
+响应示例（位置 5：两份作"不"、一份作"否"，建议为"不"；位置 2 的 `?` 补字只有一种已知字，不列入）：
+
+```json
+{
+  "text": "学而时习之不",
+  "variants": [
+    {
+      "pos": 5,
+      "char": "不",
+      "candidates": [
+        { "char": "不", "segments": [0, 1] },
+        { "char": "否", "segments": [2] }
+      ],
+      "suggested": "不"
+    }
+  ]
+}
+```
+
+三方各执一字、最高票并列时 `suggested` 为 `null`：
+
+```bash
+curl -X POST http://localhost:8000/api/collate \
+  -H "Content-Type: application/json" \
+  -d '{"segments": ["甲乙丙丁戊", "甲乙戌丁戊", "甲乙亥丁戊"]}'
+```
+
+```json
+{
+  "text": "甲乙丙丁戊",
+  "variants": [
+    {
+      "pos": 2,
+      "char": "丙",
+      "candidates": [
+        { "char": "丙", "segments": [0] },
+        { "char": "亥", "segments": [2] },
+        { "char": "戌", "segments": [1] }
+      ],
+      "suggested": null
+    }
+  ]
+}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `text` | 拼接文本，与 `/api/assemble` 的结果一致，不被自动改写 |
+| `variants[].pos` | 异文位置（`text` 中的下标，从 0 开始，按位置升序） |
+| `variants[].char` | 当前拼接文本在该位置的字（异字冲突时保留的是拼接时的左段字） |
+| `variants[].candidates` | 各候选已知字（不含 `?`）及支持它的原始段序号；按票数降序、同票按字形升序 |
+| `variants[].candidates[].segments` | 支持该候选字的原始段序号（从 0 开始，升序；同段重复只计一次） |
+| `variants[].suggested` | 建议字：唯一最高票候选；最高票并列时为 `null` |
+
 ## 计分与并列规则
 
 - 相同字 **+2**；`?` 与任意字配对 **0**；异字 **-2**；
@@ -180,7 +260,8 @@ pytest
 app/
   aligner.py    # 核心算法：后缀-前缀重叠对齐（仿射空缺罚分 DP + 回溯）
   assembler.py  # 多段顺序拼接：逐段复用对齐 + 续接门槛 + 逐字来源
-  main.py       # FastAPI 接口与请求/响应模型（/api/align、/api/assemble）
+  collator.py   # 异文校勘：复用拼接与来源，逐位置回查原字并按段投票
+  main.py       # FastAPI 接口与请求/响应模型（/api/align、/api/assemble、/api/collate）
 tests/          # 算法与接口测试
 Dockerfile      # 镜像构建（含依赖安装）
 docker-compose.yml

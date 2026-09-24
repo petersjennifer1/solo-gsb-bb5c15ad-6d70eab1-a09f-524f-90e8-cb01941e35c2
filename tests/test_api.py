@@ -115,3 +115,78 @@ def test_assemble_total_too_long_rejected():
 def test_assemble_empty_segment_rejected():
     resp = client.post("/api/assemble", json={"segments": ["abc", ""]})
     assert resp.status_code == 422
+
+
+def test_collate_unique_and_null_suggestion():
+    resp = client.post(
+        "/api/collate",
+        json={"segments": ["甲乙丙丁戊", "甲乙戌丁戊", "甲乙亥丁戊"]},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["text"] == "甲乙丙丁戊"
+    (v,) = data["variants"]
+    assert v["pos"] == 2
+    assert v["char"] == "丙"
+    assert {c["char"]: c["segments"] for c in v["candidates"]} == {
+        "丙": [0],
+        "戌": [1],
+        "亥": [2],
+    }
+    assert v["suggested"] is None  # 三方各一票，并列最高票
+
+    # 唯一最高票：两份"丙"对一份"戌"
+    resp = client.post(
+        "/api/collate",
+        json={"segments": ["甲乙丙丁戊", "甲乙戌丁戊", "甲乙丙丁戊"]},
+    )
+    (v,) = resp.json()["variants"]
+    assert v["suggested"] == "丙"
+    assert v["candidates"] == [
+        {"char": "丙", "segments": [0, 2]},
+        {"char": "戌", "segments": [1]},
+    ]
+
+
+def test_collate_wildcard_fill_not_listed():
+    resp = client.post(
+        "/api/collate",
+        json={"segments": ["学而时习之", "学而?习之"]},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["text"] == "学而时习之"
+    assert data["variants"] == []
+
+
+def test_collate_does_not_rewrite_text():
+    resp = client.post(
+        "/api/collate",
+        json={"segments": ["甲乙丙丁戊", "甲乙戌丁戊"]},
+    )
+    data = resp.json()
+    # 拼接保留左段字"丙"，即便建议字也是"丙"，text 与 assemble 一致
+    assert data["text"][2] == data["variants"][0]["char"] == "丙"
+
+
+def test_collate_gate_failure_returns_422():
+    resp = client.post(
+        "/api/collate",
+        json={"segments": ["孔子曰未知", "未知生焉", "完全无关文本"]},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["failed_segment"] == 2
+
+
+def test_collate_shares_assemble_limits():
+    assert client.post("/api/collate", json={"segments": ["abc"]}).status_code == 422
+    assert client.post(
+        "/api/collate",
+        json={"segments": ["aa", "bb", "cc", "dd", "ee", "ff"]},
+    ).status_code == 422
+    assert client.post(
+        "/api/collate", json={"segments": ["a" * 500, "b" * 501]},
+    ).status_code == 422
+    assert client.post(
+        "/api/collate", json={"segments": ["abc", ""]},
+    ).status_code == 422
